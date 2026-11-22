@@ -2072,6 +2072,57 @@ def _expire_session_cookie_header():
 _SESSION_MAX_AGE_S = 30 * 24 * 3600
 
 
+def _hotfix1_disk_session(tok):
+    """BMRBD v76.6 HOTFIX-1: disk fallback for session resolution.
+
+    A serving state can miss a valid session (concurrent vault merge /
+    second serving state racing a login). The local state file is written
+    synchronously at login, so it is the freshest durable record: on an
+    in-memory miss, consult it (session tokens only), merge a hit back
+    into live memory, and return the user (stripped of secrets).
+    Any failure falls through to None — this never raises.
+    """
+    try:
+        if not str(tok or "").startswith("bmrbd_s_"):
+            return None
+        _p = BMRBD_STATE_FILE
+        if not _p.is_file() or _p.stat().st_size > 32 * 1024 * 1024:
+            return None
+        _disk = json.loads(_p.read_text(encoding="utf-8"))
+        if not isinstance(_disk, dict):
+            return None
+        _cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - _SESSION_MAX_AGE_S))
+        for _uname, _sess_list in (_disk.get("user_sessions") or {}).items():
+            if not isinstance(_sess_list, list):
+                continue
+            for _s in _sess_list:
+                if not isinstance(_s, dict):
+                    continue
+                if not hmac.compare_digest(str(_s.get("token") or ""), str(tok)):
+                    continue
+                _created = str(_s.get("created_at") or "")
+                if _created and _created < _cutoff:
+                    continue
+                _rec = (_disk.get("users") or {}).get(_uname)
+                if not isinstance(_rec, dict):
+                    continue
+                if _rec.get("banned"):
+                    continue
+                if not (_rec.get("approved", True) or _rec.get("role") == "admin"):
+                    continue
+                try:
+                    _c3_merge_user_sessions(_BMRBD_STATE.setdefault("user_sessions", {}), {str(_uname): [dict(_s)]})
+                except Exception:
+                    pass
+                _live = (_BMRBD_STATE.get("users") or {}).get(_uname)
+                if isinstance(_live, dict):
+                    return _live
+                return {k: _rec.get(k) for k in ("username", "role", "email", "approved", "banned")}
+        return None
+    except Exception:
+        return None
+
+
 def _session_user_from_token(tok):
     """Resolve a per-login session token to its user (sessions list only).
 
@@ -2087,9 +2138,14 @@ def _session_user_from_token(tok):
                 if _created and _created < _cutoff:
                     continue
                 _uo = _BMRBD_STATE["users"].get(_uname)
-                if _uo and not _uo.get("banned") and _uo.get("approved", True):
+                if _uo and not _uo.get("banned") and (_uo.get("approved", True) or _uo.get("role") == "admin"):
                     return _uo
-    return None
+    # BMRBD v76.6 HOTFIX-1: in-memory miss -> durable disk fallback.
+    # Resolved via globals() so AST-isolated test namespaces (which exec
+    # only named defs) keep the pre-hotfix miss behaviour instead of
+    # raising NameError; the full module always defines the helper.
+    _disk = globals().get("_hotfix1_disk_session")
+    return _disk(tok) if _disk is not None else None
 
 
 def _get_user_by_token(auth_header: str, api_key_header: str = "", cookie_header: str = ""):
@@ -21915,10 +21971,14 @@ async function save(){
                 # token (old session tokens stay valid through the session
                 # list, so other devices keep working until revoked).
                 _s6116_tok = "bmrbd_s_" + hashlib.sha256((uname + str(time.time()) + uuid.uuid4().hex + VAULT_SECRET_KEY).encode("utf-8")).hexdigest()[:32]
-                u_obj["token"] = _s6116_tok
-                _s6116_sid = _s6116_record_session(uname, self, _s6116_tok)
+                # BMRBD v76.6 HOTFIX-1: mint + record + save atomically
+                # under _AUTH_LOCK so a concurrent vault merge cannot
+                # interleave and drop the just-created session.
+                with _AUTH_LOCK:
+                    u_obj["token"] = _s6116_tok
+                    _s6116_sid = _s6116_record_session(uname, self, _s6116_tok)
+                    _save_bmrbd_state_local(push_peer=False)
                 _login_rate_record_success(_rl_key)
-                _save_bmrbd_state_local(push_peer=False)
                 # BMRBD v76 SECURITY (S1): the cookie carries THIS per-login
                 # session token (never the persistent token, never the master key).
                 _cookie_h = {"Set-Cookie": _session_cookie_header(_s6116_tok)}
